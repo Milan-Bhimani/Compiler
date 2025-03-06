@@ -1,5 +1,5 @@
-from flask import Flask, render_template, request, redirect, url_for, session, send_file, flash
-from flask_sqlalchemy import SQLAlchemy
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file
+from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
 from io import BytesIO
@@ -7,6 +7,7 @@ import docker
 from docker.errors import DockerException
 from dotenv import load_dotenv
 from sqlalchemy.exc import OperationalError
+from extensions import db
 
 # Load environment variables
 load_dotenv()
@@ -16,7 +17,13 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your_secret_key')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:kittu@db.ysgdpkhwfimomuptacnx.supabase.co:5432/postgres')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-db = SQLAlchemy(app)
+# Initialize SQLAlchemy with the app
+db.init_app(app)
+
+# Initialize Flask-Login
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
 
 # Initialize Docker client
 try:
@@ -30,18 +37,13 @@ except DockerException as e:
 from user_profile import user_profile_bp
 app.register_blueprint(user_profile_bp, url_prefix='/profile')
 
-# Define models
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(120), nullable=False)
+# Import models
+from models import User, Document, Problem, Progress
 
-class Document(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(120), nullable=False)
-    content = db.Column(db.Text, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    language = db.Column(db.String(50))
+# User loader for Flask-Login
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
 
 # Create tables with error handling
 try:
@@ -53,7 +55,7 @@ except OperationalError as e:
 
 @app.route('/')
 def index():
-    if 'user_id' in session:
+    if current_user.is_authenticated:
         return redirect(url_for('start'))
     return render_template('index.html')
 
@@ -63,8 +65,8 @@ def login():
         username = request.form['username']
         password = request.form['password']
         user = User.query.filter_by(username=username).first()
-        if user and check_password_hash(user.password_hash, password):
-            session['user_id'] = user.id
+        if user and user.check_password(password):
+            login_user(user)
             return redirect(url_for('start'))
         flash('Invalid credentials')
     return render_template('login.html')
@@ -77,8 +79,8 @@ def register():
         if User.query.filter_by(username=username).first():
             flash('User already exists.')
             return redirect(url_for('register'))
-        hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
-        new_user = User(username=username, password_hash=hashed_password)
+        new_user = User(username=username)
+        new_user.set_password(password)
         db.session.add(new_user)
         db.session.commit()
         flash('Registration successful! Please log in.')
@@ -86,14 +88,14 @@ def register():
     return render_template('register.html')
 
 @app.route('/logout')
+@login_required
 def logout():
-    session.pop('user_id', None)
+    logout_user()
     return redirect(url_for('index'))
 
 @app.route('/start', methods=['GET', 'POST'])
+@login_required
 def start():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
     if request.method == 'POST':
         title = request.form['title']
         language = request.form['language']
@@ -104,9 +106,8 @@ def start():
     return render_template('start.html')
 
 @app.route('/editor')
+@login_required
 def editor():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
     title = request.args.get('title')
     language = request.args.get('language')
     if not title or not language:
@@ -114,32 +115,28 @@ def editor():
     return render_template('editor.html', title=title, language=language)
 
 @app.route('/new')
+@login_required
 def new_file():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
     return redirect(url_for('start'))
 
 @app.route('/save', methods=['POST'])
+@login_required
 def save():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
     content = request.form['content']
     title = request.form['title']
     language = request.form['language']
     if not title:
         flash('Title is required.')
         return redirect(url_for('start'))
-    new_document = Document(title=title, content=content, user_id=session['user_id'], language=language)
+    new_document = Document(title=title, content=content, user_id=current_user.id, language=language)
     db.session.add(new_document)
     db.session.commit()
     flash('Document saved successfully!')
     return redirect(url_for('editor', title=title, language=language))
 
 @app.route('/save_and_download', methods=['POST'])
+@login_required
 def save_and_download():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    
     content = request.form['content']
     title = request.form['title']
     language = request.form['language']
@@ -148,7 +145,6 @@ def save_and_download():
         flash('Title is required.')
         return redirect(url_for('start'))
 
-    # Define language extensions
     language_map = {
         'python': '.py',
         'javascript': '.js',
@@ -160,7 +156,6 @@ def save_and_download():
         'php': '.php',
     }
     
-    # Define MIME types
     mime_types = {
         'python': 'text/x-python',
         'javascript': 'application/javascript',
@@ -172,45 +167,35 @@ def save_and_download():
         'php': 'application/x-httpd-php',
     }
 
-    # Get the correct extension for the language
     expected_ext = language_map.get(language, '.txt')
-    
-    # Check if the title already has the correct extension
     if not title.lower().endswith(expected_ext):
         filename = f"{title}{expected_ext}"
     else:
         filename = title
 
-    # Get the appropriate MIME type
     mime_type = mime_types.get(language, 'text/plain')
 
-    # Save the document
     new_document = Document(
         title=title,
         content=content,
-        user_id=session['user_id'],
+        user_id=current_user.id,
         language=language
     )
     db.session.add(new_document)
     db.session.commit()
 
-    # Create the response
     response = send_file(
         BytesIO(content.encode('utf-8')),
         mimetype=mime_type,
         as_attachment=True,
-        download_name=filename  # Use download_name instead of attachment_filename
+        download_name=filename
     )
-
-    # Add Content-Disposition header explicitly
     response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
-    
     return response
 
 @app.route('/open', methods=['POST'])
+@login_required
 def open_file():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
     file = request.files['file']
     filename = file.filename
     content = file.read().decode('utf-8', errors='ignore')
@@ -235,9 +220,8 @@ def open_file():
         return redirect(url_for('start'))
 
 @app.route('/execute_code', methods=['POST'])
+@login_required
 def execute_code():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
     content = request.form['content']
     language = request.form['language']
     title = request.form.get('title')
@@ -290,26 +274,11 @@ def execute_code():
     except DockerException as e:
         output = f"Execution error: {str(e)}"
 
-    new_document = Document(title=base_title, content=content, user_id=session['user_id'], language=language)
+    new_document = Document(title=base_title, content=content, user_id=current_user.id, language=language)
     db.session.add(new_document)
     db.session.commit()
 
     return render_template('editor.html', content=content, title=title, output=output, language=language)
 
-@app.route('/profile/progress')
-def profile_progress():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    return render_template('profile_progress.html', user=user)
-
-@app.route('/profile/problems')
-def profile_problems():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    documents = Document.query.filter_by(user_id=session['user_id']).all()
-    return render_template('profile_problems.html', user=user, documents=documents)
-
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000)
